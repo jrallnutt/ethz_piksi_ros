@@ -28,12 +28,16 @@ add_message_files(
     Dops.msg
     DopsMulti.msg
     ExtEvent.msg
+    EphemerisGps.msg
+    EphemerisGlo.msg
     GpsTime.msg
     GpsTimeMulti.msg
+    GlonassBiases.msg
     Heartbeat.msg
     ImuAuxMulti.msg
     ImuRawMulti.msg
     InfoWifiCorrections.msg
+    Iono.msg
     Log.msg
     MagRaw.msg
     MeasurementState_V2_4_1.msg

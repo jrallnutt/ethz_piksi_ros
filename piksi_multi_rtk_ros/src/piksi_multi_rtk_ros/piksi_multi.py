@@ -6,7 +6,7 @@
 #  Dependencies: libsbp (https://github.com/swift-nav/libsbp), tested with version = see LIB_SBP_VERSION_MULTI
 #  Based on original work of https://bitbucket.org/Daniel-Eckert/piksi_node
 #
-
+import pprint
 import rospy
 import math
 import quaternion
@@ -22,7 +22,8 @@ from piksi_rtk_msgs.msg import (AgeOfCorrections, BaselineEcef, BaselineHeading,
                                 InfoWifiCorrections, Log, MagRaw, MeasurementState_V2_4_1, Observation,
                                 PositionWithCovarianceStamped, PosEcef, PosEcefCov, PosLlhCov, PosLlhMulti,
                                 ReceiverState_V2_4_1, UartState_V2_3_15, UtcTimeMulti,
-                                VelEcef, VelEcefCov, VelNed, VelNedCov, VelocityWithCovarianceStamped)
+                                VelEcef, VelEcefCov, VelNed, VelNedCov, VelocityWithCovarianceStamped,
+                                EphemerisGps, EphemerisGlo, Iono, GlonassBiases)
 from piksi_rtk_msgs.srv import *
 from geometry_msgs.msg import (PoseWithCovarianceStamped, PointStamped, PoseWithCovariance, Point, TransformStamped,
                                Transform)
@@ -55,6 +56,8 @@ import re
 import threading
 import sys
 import collections
+import os
+import platform
 
 
 class PiksiMulti:
@@ -229,6 +232,36 @@ class PiksiMulti:
         # Spin.
         rospy.spin()
 
+
+    def start_log(self):
+        if not os.path.isdir(self.log_directory):
+            rospy.logwarn("Log Directory invalid")
+            return
+
+        # create new empty binary file
+        hostname = platform.uname()[1]
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = "piksi_" + hostname + "_" + stamp + ".sbp"
+        filepath = os.path.join(self.log_directory, filename)
+
+        try:
+            self.log_file_handle = open(filepath, "w+b")
+            rospy.loginfo("Logging Observations to file " + filepath)
+        except IOError:
+            rospy.logwarn("Could not open log file for observations " + filepath)
+            self.log_file_handle = []
+
+    def close_log(self):
+        if self.log_file_handle:
+            self.log_file_handle.flush()
+            self.log_file_handle.close()
+
+
+    def write_log(self, raw_sbp_msg):
+        if self.log_file_handle:
+            self.log_file_handle.write(raw_sbp_msg)
+            self.log_file_handle.flush()    # we always flush to avoid loosing data on crash...
+
     def create_topic_callbacks(self):
         # Callbacks from SBP messages (cb_sbp_*) implemented "manually".
         self.handler.add_callback(self.cb_sbp_glonass_biases, msg_type=SBP_MSG_GLO_BIASES)
@@ -242,6 +275,9 @@ class PiksiMulti:
         self.handler.add_callback(self.cb_sbp_uart_state, msg_type=SBP_MSG_UART_STATE)
         self.handler.add_callback(self.cb_sbp_utc_time, msg_type=SBP_MSG_UTC_TIME)
         self.handler.add_callback(self.cb_sbp_ext_event, msg_type=SBP_MSG_EXT_EVENT)
+        self.handler.add_callback(self.cb_sbp_ephemeris_gps, msg_type=SBP_MSG_EPHEMERIS_GPS)
+        self.handler.add_callback(self.cb_sbp_ephemeris_glo, msg_type=SBP_MSG_EPHEMERIS_GLO)
+        self.handler.add_callback(self.cb_sbp_iono, msg_type=SBP_MSG_IONO)
 
         # Callbacks generated "automatically".
         self.init_callback('baseline_ecef_multi', BaselineEcef,
@@ -310,6 +346,15 @@ class PiksiMulti:
         else:
             rospy.loginfo("Starting device in Rover Mode")
             self.multicast_recv = UdpHelpers.SbpUdpMulticastReceiver(self.udp_port, self.multicast_callback)
+
+      # Observation logging settings
+      # For everytime ROS is launched, a file is written.
+        self.log_observations = rospy.get_param("~log_observations", False)
+        self.log_directory  = os.path.expanduser(rospy.get_param("~log_directory", "~/piksi_observations"))
+        self.log_file_handle = []
+        if self.log_observations:
+                self.start_log()
+
 
     def init_num_corrections_msg(self):
         num_wifi_corrections = InfoWifiCorrections()
@@ -443,6 +488,17 @@ class PiksiMulti:
                                                          BasePosLlh, queue_size=10)
             publishers['base_pos_ecef'] = rospy.Publisher(rospy.get_name() + '/base_pos_ecef',
                                                           BasePosEcef, queue_size=10)
+            publishers['ephemeris_gps'] = rospy.Publisher(rospy.get_name() + '/ephemeris_gps',
+                                                        EphemerisGps, queue_size=10)
+            publishers['ephemeris_glo'] = rospy.Publisher(rospy.get_name() + '/ephemeris_glo',
+                                                        EphemerisGlo, queue_size=10)
+            publishers['iono'] = rospy.Publisher(rospy.get_name() + '/iono',
+                                                        Iono, queue_size=10)
+            publishers['glonass_biases'] = rospy.Publisher(rospy.get_name() + '/glonass_biases',
+                                                        GlonassBiases, queue_size=10)
+
+
+
         if not self.base_station_mode:
             publishers['wifi_corrections'] = rospy.Publisher(rospy.get_name() + '/debug/wifi_corrections',
                                                              InfoWifiCorrections, queue_size=10)
@@ -563,10 +619,13 @@ class PiksiMulti:
             self.handler.add_callback(callback_function, msg_type=sbp_msg_type)
 
     def cb_sbp_obs(self, msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
+
         if self.debug_mode and self.publishers['observation'].get_num_connections() > 0:
             msg = MsgObs(msg_raw)
-
             obs_msg = Observation()
+            #pprint.pprint(msg.to_binary())
 
             obs_msg.header.stamp = rospy.Time.now()
             if (self.use_gps_time):
@@ -605,6 +664,107 @@ class PiksiMulti:
         if self.base_station_mode:
             self.multicaster.sendSbpPacket(msg_raw)
 
+
+    def cb_sbp_ephemeris_gps(self,msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
+
+        if self.debug_mode and self.publishers['ephemeris_gps'].get_num_connections() > 0:
+            msg = MsgEphemerisGPS(msg_raw)
+
+            ephGps_msg = EphemerisGps()
+
+            ephGps_msg.header.stamp = rospy.Time.now()
+            ephGps_msg.tgd = msg.tgd
+            ephGps_msg.c_rs = msg.c_rs
+            ephGps_msg.c_rc = msg.c_rc
+            ephGps_msg.c_uc = msg.c_uc
+            ephGps_msg.c_us = msg.c_us
+            ephGps_msg.c_ic = msg.c_ic
+            ephGps_msg.c_is = msg.c_is
+            ephGps_msg.dn = msg.dn
+            ephGps_msg.ecc = msg.ecc
+            ephGps_msg.sqrta = msg.sqrta
+            ephGps_msg.omega0 = msg.omega0
+            ephGps_msg.omegadot = msg.omegadot
+            ephGps_msg.w = msg.w
+            ephGps_msg.inc = msg.inc
+            ephGps_msg.inc_dot = msg.inc_dot
+            ephGps_msg.af0 = msg.af0
+            ephGps_msg.af1 = msg.af1
+            ephGps_msg.af2 = msg.af2
+            ephGps_msg.toc_tow = msg.toc.tow
+            ephGps_msg.toc_wn = msg.toc.wn
+            ephGps_msg.iode = msg.iode
+            ephGps_msg.iodc = msg.iodc
+            ephGps_msg.common_sid_sat = msg.common.sid.sat
+            ephGps_msg.common_sid_code = msg.common.sid.code
+            ephGps_msg.common_toe_tow = msg.common.toe.tow
+            ephGps_msg.common_toe_wn = msg.common.toe.wn
+            ephGps_msg.common_ura = msg.common.ura
+            ephGps_msg.common_fit_interval = msg.common.fit_interval
+            ephGps_msg.common_valid = msg.common.valid
+            ephGps_msg.common_health_bits =  msg.common.health_bits
+
+            self.publishers['ephemeris_gps'].publish(ephGps_msg)
+
+
+
+
+    def cb_sbp_ephemeris_glo(self,msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
+
+        if self.debug_mode and self.publishers['ephemeris_glo'].get_num_connections() > 0:
+            msg = MsgEphemerisGlo(msg_raw)
+            ephGlo_msg = EphemerisGlo()
+            #pprint.pprint(msg)
+            ephGlo_msg.header.stamp = rospy.Time.now()
+
+            #<MsgEphemerisGlo: {acc = [0.0, -9.313225746154785e-07, -1.862645149230957e-06], tau = -2.927146852016449e-06, d_tau = -2.7939677238464355e-09, fcn = 13, pos = [8576861.81640625, 6890945.80078125, 23046961.9140625], common = Container(sid=Container(sat=3)(code=3))(toe=Container(tow=391518)(wn=2074))(ura=2.5)(fit_interval=2400)(valid=1)(health_bits=0), vel = [-1828.0506134033203, 2560.1911544799805, -89.62631225585938], iod = 124, gamma = 9.094947017729282e-13}>
+
+            ephGlo_msg.common_sid_sat = msg.common.sid.sat
+            ephGlo_msg.common_sid_code = msg.common.sid.sat
+            ephGlo_msg.common_toe_tow = msg.common.toe.tow
+            ephGlo_msg.common_toe_wn = msg.common.toe.wn
+            ephGlo_msg.common_ura = msg.common.ura
+            ephGlo_msg.common_fit_interval = msg.common.fit_interval
+            ephGlo_msg.common_valid = msg.common.valid
+            ephGlo_msg.common_health_bits = msg.common.health_bits
+            ephGlo_msg.gamma = msg.gamma
+            ephGlo_msg.tau = msg.tau
+            ephGlo_msg.d_tau = msg.d_tau
+            ephGlo_msg.pos = msg.pos
+            ephGlo_msg.vel = msg.vel
+            ephGlo_msg.acc = msg.acc
+            ephGlo_msg.fcn = msg.fcn
+            ephGlo_msg.iod = msg.iod
+            self.publishers['ephemeris_glo'].publish(ephGlo_msg)
+
+    def cb_sbp_iono(self,msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
+
+        if self.debug_mode and self.publishers['iono'].get_num_connections() > 0:
+            msg = MsgIono(msg_raw)
+            iono_msg = Iono()
+            pprint.pprint(msg)
+            iono_msg.header.stamp = rospy.Time.now()
+
+            iono_msg.t_nmct_tow = msg.t_nmct.tow
+            iono_msg.t_nmct_wn = msg.t_nmct.wn
+            iono_msg.a0 = msg.a0
+            iono_msg.a1 = msg.a1
+            iono_msg.a2 = msg.a2
+            iono_msg.a3 = msg.a3
+            iono_msg.b0 = msg.b0
+            iono_msg.b1 = msg.b1
+            iono_msg.b2 = msg.b2
+            iono_msg.b3 = msg.b3
+
+            self.publishers['iono'].publish(iono_msg)
+
+
     def cb_sbp_base_pos_llh(self, msg_raw, **metadata):
         if self.debug_mode:
             msg = MsgBasePosLLH(msg_raw)
@@ -619,6 +779,8 @@ class PiksiMulti:
             self.publishers['base_pos_llh'].publish(pose_llh_msg)
 
     def cb_sbp_base_pos_ecef(self, msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
         if self.debug_mode and self.publishers['base_pos_ecef'].get_num_connections() > 0:
             msg = MsgBasePosECEF(msg_raw)
 
@@ -633,6 +795,8 @@ class PiksiMulti:
 
         if self.base_station_mode:
             self.multicaster.sendSbpPacket(msg_raw)
+
+
 
     def cb_sbp_uart_state(self, msg_raw, **metadata):
         if self.publishers['uart_state'].get_num_connections() == 0:
@@ -710,8 +874,25 @@ class PiksiMulti:
             rospy.logwarn("Received external SBP msg, but Piksi not connected.")
 
     def cb_sbp_glonass_biases(self, msg_raw, **metadata):
+        if self.log_observations:
+            self.write_log(msg_raw.to_binary())
+        if self.debug_mode and self.publishers['glonass_biases'].get_num_connections() > 0:
+            msg = MsgGloBiases(msg_raw)
+            #pprint.pprint(msg)
+            glonass_biases_msg = GlonassBiases()
+
+            glonass_biases_msg.header.stamp = rospy.Time.now()
+            glonass_biases_msg.mask = msg.mask
+            glonass_biases_msg.l1ca_bias = msg.l1ca_bias
+            glonass_biases_msg.l1p_bias = msg.l1p_bias
+            glonass_biases_msg.l2ca_bias = msg.l2ca_bias
+            glonass_biases_msg.l2p_bias = msg.l2p_bias
+
+            self.publishers['glonass_biases'].publish(glonass_biases_msg)
+
         if self.base_station_mode:
             self.multicaster.sendSbpPacket(msg_raw)
+
 
     def cb_watchdog(self, event):
         if ((rospy.get_rostime() - self.watchdog_time).to_sec() > 10.0):
@@ -1565,7 +1746,7 @@ class PiksiMulti:
         self.gyro_scale = gyro_range * PiksiMulti.kGyroPrescale
 
         self.has_imu_scale = True
-        rospy.loginfo_once("Received IMU scale.")
+        #rospy.loginfo_once("Received IMU scale.")
 
     def cb_sbp_mag_raw(self, msg_raw, **metadata):
         msg = MsgMagRaw(msg_raw)
